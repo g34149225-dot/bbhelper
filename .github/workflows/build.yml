@@ -44,7 +44,30 @@ jobs:
           EOF
           cat > src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
-          
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <application android:label="BB помощник"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".CaptureService" android:exported="false"
+                      android:foregroundServiceType="mediaProjection"/>
+                  <service android:name=".Tapper" android:exported="false" android:label="BB помощник"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService"/>
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/acc"/>
+                  </service>
+              </application>
+          </manifest>
           EOF
           cat > src/main/res/xml/acc.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
@@ -54,3 +77,98 @@ jobs:
           EOF
           cat > src/main/java/com/example/bbhelper/App.kt <<'EOF'
           package com.example.bbhelper
+
+          import android.accessibilityservice.*
+          import android.app.*
+          import android.view.accessibility.AccessibilityEvent
+          import android.app.Activity
+          import android.content.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.*
+          import android.hardware.display.DisplayManager
+          import android.media.ImageReader
+          import android.media.projection.*
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.*
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.util.DisplayMetrics
+          import android.view.*
+          import android.view.WindowManager.LayoutParams as LP
+          import android.widget.*
+
+
+          object Solver {
+              const val N = 8
+              class Move(val pi: Int, val cells: List<IntArray>, val r: Int, val c: Int)
+              private class St(val b: BooleanArray, val mv: List<Move>, val used: List<Int>, val cl: Int, val sc: Double)
+
+              fun sim(b: BooleanArray, cs: List<IntArray>, r: Int, c: Int): Pair<BooleanArray, Int> {
+                  val nb = b.copyOf()
+                  for (p in cs) nb[(r + p[0]) * N + c + p[1]] = true
+                  val rows = (0 until N).filter { i -> (0 until N).all { nb[i * N + it] } }
+                  val cols = (0 until N).filter { i -> (0 until N).all { nb[it * N + i] } }
+                  for (i in rows) for (j in 0 until N) nb[i * N + j] = false
+                  for (i in cols) for (j in 0 until N) nb[j * N + i] = false
+                  return nb to (rows.size + cols.size)
+              }
+
+              private fun fits(b: BooleanArray, cs: List<IntArray>, r: Int, c: Int) =
+                  cs.all { r + it[0] < N && c + it[1] < N && !b[(r + it[0]) * N + c + it[1]] }
+
+              private fun struct(b: BooleanArray): Double {
+                  fun g(r: Int, c: Int) = if (r < 0 || c < 0 || r >= N || c >= N || b[r * N + c]) 1 else 0
+                  var t = 0; var h = 0; var f = 0
+                  for (r in 0 until N) for (c in 0 until N) {
+                      val v = g(r, c); f += v
+                      if (g(r, c + 1) != v) t++
+                      if (g(r + 1, c) != v) t++
+                      if (c == 0 && v == 0) t++
+                      if (r == 0 && v == 0) t++
+                      if (v == 0 && g(r - 1, c) + g(r + 1, c) + g(r, c - 1) + g(r, c + 1) >= 3) h++
+                  }
+                  return -t * 2.5 - h * 10 - f * 0.5
+              }
+
+              fun solve(b0: BooleanArray, ps: List<List<IntArray>?>): List<Move>? {
+                  val idx = ps.indices.filter { ps[it] != null }
+                  var beam = listOf(St(b0, emptyList(), emptyList(), 0, 0.0))
+                  var best: St? = null
+                  for (d in idx.indices) {
+                      val nx = ArrayList<St>()
+                      for (s in beam) for (i in idx) {
+                          if (i in s.used) continue
+                          val cs = ps[i]!!
+                          for (r in 0 until N) for (c in 0 until N) {
+                              if (!fits(s.b, cs, r, c)) continue
+                              val (nb, n) = sim(s.b, cs, r, c)
+                              val cl = s.cl + n
+                              nx.add(St(nb, s.mv + Move(i, cs, r, c), s.used + i, cl, cl * 40.0 + struct(nb)))
+                          }
+                      }
+                      if (nx.isEmpty()) break
+                      nx.sortByDescending { it.sc }
+                      beam = nx.take(60); best = beam[0]
+                  }
+                  return best?.mv
+              }
+          }
+
+
+
+          class MainActivity : Activity() {
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  val l = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
+                  l.addView(TextView(this).apply {
+                      textSize = 16f
+                      text = "1. Дай разрешение «Поверх других окон».\n2. Нажми «Запустить» и разреши захват экрана.\n" +
+                          "3. Открой Block Blast, нажми ⚙ справа вверху и совмести зелёную сетку с полем и фигурами.\n" +
+                          "4. Закрой ⚙ — подсказки появятся сами: цветные рамки 1, 2, 3 = порядок и места фигур.\n5. Кнопка «Авто» рядом с ⚙ включает самостоятельную расстановку."
+                  })
+                  l.addView(Button(this).apply { text = "Запустить"; setOnClickListener { start() } })
+                  l.addView(Button(this).apply {
+                      text = "Служба доступности (для авто-хода)"
+                      setOnClickListener { startActivity(Intent(Setti
